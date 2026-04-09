@@ -1,0 +1,35 @@
+name: Skyscanner Price Tracker
+
+on:
+  schedule:
+    # Co 6 godzin: 00:00, 06:00, 12:00, 18:00 UTC (= 02:00, 08:00, 14:00, 20:00 PL czasu letniego)
+    - cron: "0 0,6,12,18 * * *"
+  workflow_dispatch:  # możliwość uruchomienia ręcznie jednym kliknięciem
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repozytorium
+        uses: actions/checkout@v4
+
+      - name: Ustaw Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Zainstaluj zależności
+        run: pip install -r requirements.txt
+
+      - name: Zapisz credentials.json z Secret
+        run: echo '${{ secrets.GOOGLE_CREDENTIALS }}' > credentials.json
+
+      - name: Uruchom scraper
+        run: python scraper.py
+
+      - name: Usuń credentials.json (bezpieczeństwo)
+        if: always()
+        run: rm -f credentials.json
