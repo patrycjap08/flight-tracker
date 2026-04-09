@@ -1,23 +1,25 @@
 #!/usr/bin/env python3
 """
-Skyscanner Flight Price Tracker
-WAW → LIS, wrzesień 2026, 2 osoby, loty bezpośrednie
-Używa Playwright + stealth żeby ominąć wykrywanie bota
+Flight Price Tracker — Amadeus API
+WAW/WMI → LIS, wrzesień 2026, 2 osoby
+Linie: LOT, TAP Air Portugal, Ryanair, Wizz Air
+Wylot przed 12:00, powrót po 13:00
 """
 
-import re
 import time
-import random
 import logging
 import datetime
+import requests
 import gspread
 from google.oauth2.service_account import Credentials
-from bs4 import BeautifulSoup
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
 
 # ─────────────────────────────────────────────────────────────────
 #  KONFIGURACJA
 # ─────────────────────────────────────────────────────────────────
+
+import os
+AMADEUS_CLIENT_ID     = os.environ.get("AMADEUS_CLIENT_ID", "")
+AMADEUS_CLIENT_SECRET = os.environ.get("AMADEUS_CLIENT_SECRET", "")
 
 GOOGLE_CREDENTIALS_FILE = "credentials.json"
 SPREADSHEET_NAME        = "Loty Lizbona 2026"
@@ -25,12 +27,19 @@ SPREADSHEET_NAME        = "Loty Lizbona 2026"
 DEPART_START = datetime.date(2026, 9, 7)
 DEPART_END   = datetime.date(2026, 9, 17)
 
-ADULTS          = 2
-CABIN           = "economy"
-STOPS           = "!oneStop,!twoPlusStops"
-DEPARTURE_TIMES = "0-720,780-1439"
+# Kody IATA lotnisk wylotu (Warszawa Chopina + Modlin)
+ORIGINS      = ["WAW", "WMI"]
+DESTINATION  = "LIS"
+ADULTS       = 2
+CABIN        = "ECONOMY"
 
-PAGE_LOAD_TIMEOUT = 60_000   # ms (Playwright używa milisekund)
+# Interesujące nas linie (kody IATA)
+ALLOWED_AIRLINES = {"LO", "TP", "FR", "W6"}
+# LO = LOT, TP = TAP Air Portugal, FR = Ryanair, W6 = Wizz Air
+
+# Filtry godzinowe
+MAX_DEPART_HOUR  = 12   # wylot z WAW/WMI przed 12:00
+MIN_RETURN_HOUR  = 13   # powrót z LIS po 13:00
 
 # ─────────────────────────────────────────────────────────────────
 
@@ -42,135 +51,136 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-def build_url(depart: datetime.date, ret: datetime.date) -> str:
-    d = depart.strftime("%y%m%d")
-    r = ret.strftime("%y%m%d")
-    return (
-        f"https://www.skyscanner.pl/transport/loty/wars/lis/{d}/{r}/"
-        f"?adultsv2={ADULTS}&cabinclass={CABIN}&childrenv2=&ref=home&rtn=1"
-        f"&outboundaltsenabled=false&inboundaltsenabled=false"
-        f"&departure-times={DEPARTURE_TIMES}&stops={STOPS}"
-    )
+# ─────────────────────────────────────────────────────────────────
+#  AMADEUS AUTH
+# ─────────────────────────────────────────────────────────────────
 
+class AmadeusClient:
+    BASE = "https://test.api.amadeus.com"  # zmień na api.amadeus.com po przejściu na produkcję
 
-def human_delay(min_s: float = 2.0, max_s: float = 5.0):
-    """Losowe opóźnienie imitujące człowieka."""
-    time.sleep(random.uniform(min_s, max_s))
+    def __init__(self, client_id: str, client_secret: str):
+        self.client_id     = client_id
+        self.client_secret = client_secret
+        self._token        = None
+        self._token_expiry = 0
 
+    def _get_token(self) -> str:
+        if self._token and time.time() < self._token_expiry - 60:
+            return self._token
 
-def fetch_page(page, url: str, label: str) -> str | None:
-    """
-    Otwiera URL w Playwright, czeka na wyniki, zwraca HTML.
-    Wykonuje losowe przewijania i ruchy myszy żeby wyglądać jak człowiek.
-    """
-    try:
-        log.info(f"  Otwieram: {url}")
-        page.goto(url, wait_until="domcontentloaded", timeout=PAGE_LOAD_TIMEOUT)
-
-        # Krótka pauza po załadowaniu DOM
-        human_delay(2, 4)
-
-        title = page.title()
-        log.info(f"  Tytuł strony: '{title}'")
-
-        # Sprawdzamy czy to captcha / blokada
-        content_lower = page.content().lower()
-        if any(x in content_lower for x in ["captcha", "access denied", "robot", "cloudflare", "challenge"]):
-            log.warning(f"  UWAGA: wygląda jak blokada bota!")
-            page.screenshot(path=f"screenshot_{label}_blocked.png", full_page=True)
-
-        # Symulujemy przewijanie strony — człowiek zazwyczaj scrolluje
-        page.mouse.move(random.randint(300, 900), random.randint(200, 600))
-        human_delay(0.5, 1.5)
-        page.evaluate("window.scrollTo(0, document.body.scrollHeight * 0.3)")
-        human_delay(1, 2)
-        page.evaluate("window.scrollTo(0, document.body.scrollHeight * 0.6)")
-        human_delay(0.5, 1.5)
-        page.evaluate("window.scrollTo(0, 0)")
-
-        # Czekamy na listę wyników lotów
-        log.info(f"  Czekam na wyniki lotów...")
-        page.wait_for_selector("ul#flights-results-list", timeout=PAGE_LOAD_TIMEOUT)
-        log.info(f"  Lista wyników załadowana!")
-
-        # Jeszcze chwila żeby załadowały się wszystkie ceny
-        human_delay(4, 6)
-        return page.content()
-
-    except PlaywrightTimeout:
-        title = page.title()
-        log.warning(f"  Timeout po {PAGE_LOAD_TIMEOUT//1000}s. Tytuł: '{title}'")
-        page.screenshot(path=f"screenshot_{label}_timeout.png", full_page=True)
-        snippet = page.content()[:500].replace(chr(10), " ")
-        log.info(f"  Początek HTML: {snippet}")
-        return page.content()
-
-    except Exception as e:
-        log.error(f"  Błąd Playwright: {e}")
-        try:
-            page.screenshot(path=f"screenshot_{label}_error.png", full_page=True)
-        except Exception:
-            pass
-        return None
-
-
-def parse_flights(html: str) -> list[dict]:
-    soup = BeautifulSoup(html, "lxml")
-    results = []
-
-    option_headers = soup.select("h3[class*='bpk-text--body-default']")
-
-    for h3 in option_headers:
-        label = h3.get_text(strip=True)
-
-        price_match = re.search(
-            r"(\d[\d\xa0\s]+\d)\s*zł\s*za pasażera.*?(\d[\d\xa0\s]+\d)\s*zł",
-            label
+        resp = requests.post(
+            f"{self.BASE}/v1/security/oauth2/token",
+            data={
+                "grant_type":    "client_credentials",
+                "client_id":     self.client_id,
+                "client_secret": self.client_secret,
+            },
+            timeout=15,
         )
-        if not price_match:
+        resp.raise_for_status()
+        data = resp.json()
+        self._token        = data["access_token"]
+        self._token_expiry = time.time() + data["expires_in"]
+        log.info("Amadeus token odświeżony")
+        return self._token
+
+    def search_flights(self, origin: str, destination: str,
+                       depart_date: str, return_date: str,
+                       adults: int, cabin: str) -> list[dict]:
+        """
+        Wyszukuje loty i zwraca surowe oferty z API.
+        depart_date / return_date w formacie YYYY-MM-DD
+        """
+        token = self._get_token()
+        params = {
+            "originLocationCode":      origin,
+            "destinationLocationCode": destination,
+            "departureDate":           depart_date,
+            "returnDate":              return_date,
+            "adults":                  adults,
+            "travelClass":             cabin,
+            "nonStop":                 "true",   # tylko loty bezpośrednie
+            "currencyCode":            "PLN",
+            "max":                     50,        # max ofert na zapytanie
+        }
+        resp = requests.get(
+            f"{self.BASE}/v2/shopping/flight-offers",
+            headers={"Authorization": f"Bearer {token}"},
+            params=params,
+            timeout=30,
+        )
+        if resp.status_code == 200:
+            return resp.json().get("data", [])
+        log.warning(f"  Amadeus HTTP {resp.status_code}: {resp.text[:200]}")
+        return []
+
+
+# ─────────────────────────────────────────────────────────────────
+#  FILTROWANIE I PARSOWANIE OFERT
+# ─────────────────────────────────────────────────────────────────
+
+def parse_hour(dt_str: str) -> int:
+    """Wyciąga godzinę z datetime ISO np. '2026-09-07T10:10:00'"""
+    return int(dt_str[11:13])
+
+
+def parse_time(dt_str: str) -> str:
+    """Zwraca HH:MM z datetime ISO"""
+    return dt_str[11:16]
+
+
+def extract_best_offer(offers: list[dict], max_depart_hour: int, min_return_hour: int) -> dict | None:
+    """
+    Z listy ofert Amadeus wybiera najtańszą która spełnia:
+    - linia lotnicza z ALLOWED_AIRLINES
+    - wylot z WAW/WMI przed max_depart_hour
+    - powrót z LIS po min_return_hour
+    """
+    candidates = []
+
+    for offer in offers:
+        try:
+            price_total = float(offer["price"]["grandTotal"])
+            price_per_person = price_total / ADULTS
+
+            itineraries = offer["itineraries"]
+            if len(itineraries) < 2:
+                continue
+
+            # Lot tam — pierwszy segment (bezpośredni więc jeden)
+            outbound_seg = itineraries[0]["segments"][0]
+            # Lot powrotny
+            inbound_seg  = itineraries[1]["segments"][0]
+
+            airline = outbound_seg["carrierCode"]
+            if airline not in ALLOWED_AIRLINES:
+                continue
+
+            out_dep_hour = parse_hour(outbound_seg["departure"]["at"])
+            in_dep_hour  = parse_hour(inbound_seg["departure"]["at"])
+
+            if out_dep_hour >= max_depart_hour:
+                continue
+            if in_dep_hour < min_return_hour:
+                continue
+
+            candidates.append({
+                "price_per_person": round(price_per_person, 2),
+                "price_total":      round(price_total, 2),
+                "outbound_dep":     parse_time(outbound_seg["departure"]["at"]),
+                "outbound_arr":     parse_time(outbound_seg["arrival"]["at"]),
+                "inbound_dep":      parse_time(inbound_seg["departure"]["at"]),
+                "inbound_arr":      parse_time(inbound_seg["arrival"]["at"]),
+                "airline":          airline,
+                "origin":           outbound_seg["departure"]["iataCode"],
+            })
+
+        except (KeyError, IndexError, ValueError):
             continue
 
-        price_per_person = int(re.sub(r"[\s\xa0]+", "", price_match.group(1)))
-        price_total      = int(re.sub(r"[\s\xa0]+", "", price_match.group(2)))
-
-        ticket_container = h3.find_parent("div", class_=re.compile("FlightsTicket_container"))
-        if not ticket_container:
-            continue
-
-        legs = ticket_container.select("div[class*='LegDetails_container']")
-        if len(legs) < 2:
-            continue
-
-        def get_times(leg):
-            dep_el = leg.select_one("[class*='routePartialDepart'] span[class*='subheading']")
-            arr_el = leg.select_one("[class*='routePartialArrive'] span[class*='subheading']")
-            dep = dep_el.get_text(strip=True) if dep_el else "?"
-            arr = arr_el.get_text(strip=True) if arr_el else "?"
-            return dep, arr
-
-        out_dep, out_arr = get_times(legs[0])
-        in_dep,  in_arr  = get_times(legs[1])
-
-        airline_el = ticket_container.select_one("img[alt]")
-        airline = airline_el["alt"] if airline_el and airline_el.get("alt") else "?"
-
-        results.append({
-            "price_per_person": price_per_person,
-            "price_total":      price_total,
-            "outbound_dep":     out_dep,
-            "outbound_arr":     out_arr,
-            "inbound_dep":      in_dep,
-            "inbound_arr":      in_arr,
-            "airline":          airline,
-        })
-
-    return results
-
-
-def cheapest(flights: list[dict]) -> dict | None:
-    if not flights:
+    if not candidates:
         return None
-    return min(flights, key=lambda f: f["price_per_person"])
+    return min(candidates, key=lambda x: x["price_total"])
 
 
 def get_all_date_pairs() -> list[tuple[datetime.date, datetime.date]]:
@@ -195,15 +205,22 @@ SHEET_HEADER = [
     "Timestamp",
     "Wylot (data)",
     "Powrót (data)",
+    "Lotnisko wylotu",
+    "Linia",
     "Cena / os. (PLN)",
     "Cena razem (PLN)",
-    "Wylot WAW",
+    "Wylot WAW/WMI",
     "Przylot LIS",
     "Wylot LIS",
-    "Przylot WAW",
-    "Linia",
-    "URL",
+    "Przylot WAW/WMI",
 ]
+
+AIRLINE_NAMES = {
+    "LO": "LOT",
+    "TP": "TAP Air Portugal",
+    "FR": "Ryanair",
+    "W6": "Wizz Air",
+}
 
 
 def get_or_create_worksheet(gc: gspread.Client, title: str) -> gspread.Worksheet:
@@ -224,24 +241,25 @@ def get_or_create_worksheet(gc: gspread.Client, title: str) -> gspread.Worksheet
     return ws
 
 
-def append_result(ws, timestamp, depart, ret, flight, url):
-    if flight:
+def append_result(ws, timestamp, depart, ret, best):
+    if best:
+        airline_name = AIRLINE_NAMES.get(best["airline"], best["airline"])
         row = [
             timestamp,
             depart.strftime("%d.%m.%Y"),
             ret.strftime("%d.%m.%Y"),
-            flight["price_per_person"],
-            flight["price_total"],
-            flight["outbound_dep"],
-            flight["outbound_arr"],
-            flight["inbound_dep"],
-            flight["inbound_arr"],
-            flight["airline"],
-            url,
+            best["origin"],
+            airline_name,
+            best["price_per_person"],
+            best["price_total"],
+            best["outbound_dep"],
+            best["outbound_arr"],
+            best["inbound_dep"],
+            best["inbound_arr"],
         ]
     else:
         row = [timestamp, depart.strftime("%d.%m.%Y"), ret.strftime("%d.%m.%Y"),
-               "BRAK DANYCH", "", "", "", "", "", "", url]
+               "", "", "BRAK OFERT", "", "", "", "", ""]
 
     ws.append_row(row, value_input_option="USER_ENTERED")
 
@@ -253,84 +271,49 @@ def append_result(ws, timestamp, depart, ret, flight, url):
 def main():
     log.info("=== Start scrapowania ===")
 
+    amadeus = AmadeusClient(AMADEUS_CLIENT_ID, AMADEUS_CLIENT_SECRET)
+
     creds = Credentials.from_service_account_file(GOOGLE_CREDENTIALS_FILE, scopes=SCOPES)
-    gc = gspread.authorize(creds)
-    ws = get_or_create_worksheet(gc, "Dane")
+    gc    = gspread.authorize(creds)
+    ws    = get_or_create_worksheet(gc, "Dane")
 
     timestamp  = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
     date_pairs = get_all_date_pairs()
-    log.info(f"Sprawdzam {len(date_pairs)} kombinacji dat")
+    log.info(f"Sprawdzam {len(date_pairs)} kombinacji dat x {len(ORIGINS)} lotniska")
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-blink-features=AutomationControlled",
-                "--disable-dev-shm-usage",
-            ]
-        )
+    for depart, ret in date_pairs:
+        depart_str = depart.strftime("%Y-%m-%d")
+        ret_str    = ret.strftime("%Y-%m-%d")
+        label      = f"{depart.strftime('%d.%m')} – {ret.strftime('%d.%m')}"
 
-        # Kontekst z realistycznymi ustawieniami przeglądarki
-        context = browser.new_context(
-            viewport={"width": 1920, "height": 1080},
-            locale="pl-PL",
-            timezone_id="Europe/Warsaw",
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
-            extra_http_headers={
-                "Accept-Language": "pl-PL,pl;q=0.9,en;q=0.8",
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-            }
-        )
+        all_offers = []
 
-        # Ukrywamy że to Playwright/automation
-        context.add_init_script("""
-            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-            Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-            Object.defineProperty(navigator, 'languages', { get: () => ['pl-PL', 'pl', 'en-US', 'en'] });
-            window.chrome = { runtime: {} };
-        """)
+        # Sprawdzamy oba lotniska (WAW i WMI)
+        for origin in ORIGINS:
+            log.info(f"Zapytanie: {origin} → {DESTINATION}  {label}")
+            offers = amadeus.search_flights(
+                origin, DESTINATION, depart_str, ret_str, ADULTS, CABIN
+            )
+            log.info(f"  Otrzymano {len(offers)} ofert z {origin}")
+            all_offers.extend(offers)
+            time.sleep(0.5)  # grzeczna przerwa między requestami
 
-        page = context.new_page()
+        best = extract_best_offer(all_offers, MAX_DEPART_HOUR, MIN_RETURN_HOUR)
 
-        try:
-            # Najpierw odwiedź stronę główną żeby zbudować cookies — jak prawdziwy użytkownik
-            log.info("Odwiedzam stronę główną Skyscanner...")
-            page.goto("https://www.skyscanner.pl", wait_until="domcontentloaded", timeout=30_000)
-            human_delay(3, 6)
+        if best:
+            airline_name = AIRLINE_NAMES.get(best["airline"], best["airline"])
+            log.info(
+                f"  Najtańszy: {best['price_per_person']} PLN/os "
+                f"({best['outbound_dep']}→{best['outbound_arr']} / "
+                f"{best['inbound_dep']}→{best['inbound_arr']}) "
+                f"[{airline_name}] z {best['origin']}"
+            )
+        else:
+            log.warning(f"  Brak ofert spełniających kryteria dla {label}")
 
-            for depart, ret in date_pairs:
-                url   = build_url(depart, ret)
-                label = f"{depart.strftime('%d.%m')}_{ret.strftime('%d.%m')}"
-                log.info(f"Pobieranie: {depart.strftime('%d.%m')} – {ret.strftime('%d.%m')}")
+        append_result(ws, timestamp, depart, ret, best)
 
-                html    = fetch_page(page, url, label)
-                flights = parse_flights(html) if html else []
-                best    = cheapest(flights)
-
-                if best:
-                    log.info(
-                        f"  Najtańszy: {best['price_per_person']} zł/os "
-                        f"({best['outbound_dep']}→{best['outbound_arr']} / "
-                        f"{best['inbound_dep']}→{best['inbound_arr']}) "
-                        f"[{best['airline']}]"
-                    )
-                else:
-                    log.warning(f"  Nie znaleziono lotów")
-
-                append_result(ws, timestamp, depart, ret, best, url)
-
-                # Przerwa między stronami — jak człowiek który czyta wyniki
-                human_delay(8, 15)
-
-        finally:
-            browser.close()
-
-    log.info("=== Koniec scrapowania ===")
+    log.info("=== Koniec ===")
 
 
 if __name__ == "__main__":
