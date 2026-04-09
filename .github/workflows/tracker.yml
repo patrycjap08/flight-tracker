@@ -8,7 +8,7 @@ on:
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
 
     steps:
       - name: Checkout repozytorium
@@ -20,14 +20,11 @@ jobs:
           python-version: "3.12"
           cache: "pip"
 
-      - name: Zainstaluj Chrome
-        uses: browser-actions/setup-chrome@v1
-
-      - name: Zainstaluj ChromeDriver
-        uses: nanasess/setup-chromedriver@v2
-
       - name: Zainstaluj zależności Python
         run: pip install -r requirements.txt
+
+      - name: Zainstaluj Playwright + Chromium
+        run: playwright install chromium --with-deps
 
       - name: Zapisz credentials.json z Secret
         run: echo '${{ secrets.GOOGLE_CREDENTIALS }}' > credentials.json
