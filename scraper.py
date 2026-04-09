@@ -2,7 +2,7 @@
 """
 Skyscanner Flight Price Tracker
 WAW → LIS, wrzesień 2026, 2 osoby, loty bezpośrednie
-Zapisuje do Google Sheets: najtańszą cenę + godziny lotu dla każdej kombinacji dat
+Używa Selenium (headless Chrome) żeby załadować JS przed parsowaniem HTML
 """
 
 import re
@@ -10,10 +10,15 @@ import time
 import random
 import logging
 import datetime
-import requests
-from bs4 import BeautifulSoup
 import gspread
 from google.oauth2.service_account import Credentials
+from bs4 import BeautifulSoup
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException
 
 # ─────────────────────────────────────────────────────────────────
 #  KONFIGURACJA
@@ -22,7 +27,6 @@ from google.oauth2.service_account import Credentials
 GOOGLE_CREDENTIALS_FILE = "credentials.json"
 SPREADSHEET_NAME        = "Loty Lizbona 2026"
 
-# Zakres dat wylotu: 07.09 – 17.09 (powrót zawsze +7 dni, max 24.09)
 DEPART_START = datetime.date(2026, 9, 7)
 DEPART_END   = datetime.date(2026, 9, 17)
 
@@ -31,16 +35,7 @@ CABIN           = "economy"
 STOPS           = "!oneStop,!twoPlusStops"
 DEPARTURE_TIMES = "0-720,780-1439"
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (X11; Linux x86_64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept-Language": "pl-PL,pl;q=0.9,en;q=0.8",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Referer": "https://www.skyscanner.pl/",
-}
+PAGE_LOAD_TIMEOUT = 30
 
 # ─────────────────────────────────────────────────────────────────
 
@@ -63,69 +58,70 @@ def build_url(depart: datetime.date, ret: datetime.date) -> str:
     )
 
 
-def fetch_page(url: str) -> str | None:
-    """Pobiera HTML strony z losowym opóźnieniem."""
+def make_driver() -> webdriver.Chrome:
+    opts = Options()
+    opts.add_argument("--headless")
+    opts.add_argument("--no-sandbox")
+    opts.add_argument("--disable-dev-shm-usage")
+    opts.add_argument("--disable-blink-features=AutomationControlled")
+    opts.add_argument("--window-size=1920,1080")
+    opts.add_argument("--lang=pl-PL")
+    opts.add_argument(
+        "user-agent=Mozilla/5.0 (X11; Linux x86_64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    )
+    opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+    opts.add_experimental_option("useAutomationExtension", False)
+    driver = webdriver.Chrome(options=opts)
+    driver.execute_cdp_cmd(
+        "Page.addScriptToEvaluateOnNewDocument",
+        {"source": "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"}
+    )
+    return driver
+
+
+def fetch_page(driver: webdriver.Chrome, url: str) -> str | None:
     try:
-        time.sleep(random.uniform(4, 9))
-        resp = requests.get(url, headers=HEADERS, timeout=30)
-        if resp.status_code == 200:
-            return resp.text
-        log.warning(f"HTTP {resp.status_code} dla {url}")
+        driver.get(url)
+        WebDriverWait(driver, PAGE_LOAD_TIMEOUT).until(
+            EC.presence_of_element_located(
+                (By.CSS_SELECTOR, "h3[class*='bpk-text--body-default']")
+            )
+        )
+        time.sleep(random.uniform(3, 5))
+        return driver.page_source
+    except TimeoutException:
+        log.warning(f"  Timeout — zwracam co jest na stronie")
+        return driver.page_source
+    except Exception as e:
+        log.error(f"  Błąd Selenium: {e}")
         return None
-    except requests.RequestException as e:
-        log.error(f"Błąd pobierania {url}: {e}")
-        return None
-
-
-def parse_time_from_leg(leg_div) -> str | None:
-    """Wyciąga godzinę wylotu z elementu LegDetails."""
-    time_el = leg_div.select_one("[class*='RoutePartial_routePartialDepart'] span[class*='subheading']")
-    if time_el:
-        return time_el.get_text(strip=True)
-    return None
 
 
 def parse_flights(html: str) -> list[dict]:
-    """
-    Parsuje HTML Skyscannera.
-    Zwraca listę ofert, każda jako słownik:
-      {
-        price_per_person: int,      # cena za 1 osobę w PLN
-        price_total: int,           # cena za obie osoby
-        outbound_dep: str,          # godzina wylotu z WAW (np. "10:10")
-        outbound_arr: str,          # godzina przylotu do LIS (np. "13:30")
-        inbound_dep: str,           # godzina wylotu z LIS
-        inbound_arr: str,           # godzina przylotu do WAW
-        airline: str,               # linia lotnicza
-      }
-    """
-    soup = BeautifulSoup(html, "html.parser")
+    soup = BeautifulSoup(html, "lxml")
     results = []
 
-    # Każda oferta ma aria-label na <h3> w stylu:
-    # "Opcja 2: 1 795 zł za pasażera. Razem: 3 590 zł."
     option_headers = soup.select("h3[class*='bpk-text--body-default']")
 
     for h3 in option_headers:
         label = h3.get_text(strip=True)
 
-        # Wyciągamy ceny
         price_match = re.search(
-            r"(\d[\d\s]+\d)\s*zł\s*za pasażera.*?(\d[\d\s]+\d)\s*zł",
+            r"(\d[\d\xa0\s]+\d)\s*zł\s*za pasażera.*?(\d[\d\xa0\s]+\d)\s*zł",
             label
         )
         if not price_match:
             continue
 
-        price_per_person = int(re.sub(r"\s+", "", price_match.group(1)))
-        price_total      = int(re.sub(r"\s+", "", price_match.group(2)))
+        price_per_person = int(re.sub(r"[\s\xa0]+", "", price_match.group(1)))
+        price_total      = int(re.sub(r"[\s\xa0]+", "", price_match.group(2)))
 
-        # Kontener biletu — cofamy się do najbliższego FlightsTicket_container
         ticket_container = h3.find_parent("div", class_=re.compile("FlightsTicket_container"))
         if not ticket_container:
             continue
 
-        # Nogi: pierwsza = tam, druga = powrót
         legs = ticket_container.select("div[class*='LegDetails_container']")
         if len(legs) < 2:
             continue
@@ -138,9 +134,8 @@ def parse_flights(html: str) -> list[dict]:
             return dep, arr
 
         out_dep, out_arr = get_times(legs[0])
-        in_dep, in_arr   = get_times(legs[1])
+        in_dep,  in_arr  = get_times(legs[1])
 
-        # Linia lotnicza — pierwsza znaleziona (tam)
         airline_el = ticket_container.select_one("img[alt]")
         airline = airline_el["alt"] if airline_el and airline_el.get("alt") else "?"
 
@@ -197,12 +192,10 @@ SHEET_HEADER = [
 
 
 def get_or_create_worksheet(gc: gspread.Client, title: str) -> gspread.Worksheet:
-    """Zwraca istniejący arkusz lub tworzy nowy z nagłówkiem."""
     try:
         sh = gc.open(SPREADSHEET_NAME)
     except gspread.SpreadsheetNotFound:
         sh = gc.create(SPREADSHEET_NAME)
-        sh.share(None, perm_type="anyone", role="reader")
         log.info(f"Utworzono nowy arkusz: {SPREADSHEET_NAME}")
 
     try:
@@ -216,8 +209,7 @@ def get_or_create_worksheet(gc: gspread.Client, title: str) -> gspread.Worksheet
     return ws
 
 
-def append_result(ws: gspread.Worksheet, timestamp: str, depart: datetime.date,
-                  ret: datetime.date, flight: dict | None, url: str):
+def append_result(ws, timestamp, depart, ret, flight, url):
     if flight:
         row = [
             timestamp,
@@ -246,47 +238,41 @@ def append_result(ws: gspread.Worksheet, timestamp: str, depart: datetime.date,
 def main():
     log.info("=== Start scrapowania ===")
 
-    # Połączenie z Google Sheets
     creds = Credentials.from_service_account_file(GOOGLE_CREDENTIALS_FILE, scopes=SCOPES)
     gc = gspread.authorize(creds)
+    ws = get_or_create_worksheet(gc, "Dane")
 
-    # Jedna zakładka per sesja (np. "2026-04-09 06:00")
-    now = datetime.datetime.now()
-    timestamp = now.strftime("%Y-%m-%d %H:%M")
-    tab_title = "Dane"  # wszystkie wpisy w jednej zakładce, timestamp w kolumnie
-
-    ws = get_or_create_worksheet(gc, tab_title)
-
+    timestamp  = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
     date_pairs = get_all_date_pairs()
     log.info(f"Sprawdzam {len(date_pairs)} kombinacji dat")
 
-    for depart, ret in date_pairs:
-        url = build_url(depart, ret)
-        label = f"{depart.strftime('%d.%m')} – {ret.strftime('%d.%m')}"
-        log.info(f"Pobieranie: {label}  {url}")
+    driver = make_driver()
+    try:
+        for depart, ret in date_pairs:
+            url   = build_url(depart, ret)
+            label = f"{depart.strftime('%d.%m')} – {ret.strftime('%d.%m')}"
+            log.info(f"Pobieranie: {label}")
 
-        html = fetch_page(url)
-        if html is None:
-            log.warning(f"  Brak odpowiedzi dla {label}")
-            append_result(ws, timestamp, depart, ret, None, url)
-            continue
+            html    = fetch_page(driver, url)
+            flights = parse_flights(html) if html else []
+            best    = cheapest(flights)
 
-        flights = parse_flights(html)
-        best = cheapest(flights)
+            if best:
+                log.info(
+                    f"  Najtańszy: {best['price_per_person']} zł/os "
+                    f"({best['outbound_dep']}→{best['outbound_arr']} / "
+                    f"{best['inbound_dep']}→{best['inbound_arr']}) "
+                    f"[{best['airline']}]"
+                )
+            else:
+                log.warning(f"  Nie znaleziono lotów dla {label}")
 
-        if best:
-            log.info(
-                f"  Najtańszy: {best['price_per_person']} zł/os "
-                f"({best['outbound_dep']}→{best['outbound_arr']} / "
-                f"{best['inbound_dep']}→{best['inbound_arr']}) "
-                f"[{best['airline']}]"
-            )
-        else:
-            log.warning(f"  Nie znaleziono lotów dla {label}")
+            append_result(ws, timestamp, depart, ret, best, url)
+            time.sleep(random.uniform(5, 10))
 
-        append_result(ws, timestamp, depart, ret, best, url)
-
-    log.info("=== Koniec scrapowania ===")
+    finally:
+        driver.quit()
+        log.info("=== Koniec scrapowania ===")
 
 
 if __name__ == "__main__":
