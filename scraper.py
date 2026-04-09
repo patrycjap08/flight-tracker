@@ -115,8 +115,7 @@ def fetch_page(driver: webdriver.Chrome, url: str, label: str) -> str | None:
         driver.save_screenshot(f"screenshot_{label.replace(' ', '_').replace('–','_')}_timeout.png")
         log.info(f"  Screenshot zapisany jako screenshot_{label}_timeout.png")
         # Logujemy pierwsze 500 znaków HTML żeby zobaczyć co zwrócił serwer
-        snippet = driver.page_source[:500].replace("
-", " ")
+        snippet = driver.page_source[:500].replace(chr(10), " ")
         log.info(f"  Początek HTML: {snippet}")
         return driver.page_source
 
