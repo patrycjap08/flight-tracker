@@ -81,21 +81,45 @@ def make_driver() -> webdriver.Chrome:
     return driver
 
 
-def fetch_page(driver: webdriver.Chrome, url: str) -> str | None:
+def fetch_page(driver: webdriver.Chrome, url: str, label: str) -> str | None:
     try:
         driver.get(url)
-        # Czekamy na listę wyników — pojawia się gdy Skyscanner załaduje bilety
+
+        # Logujemy tytuł strony — po nim widać czy to wyniki, captcha, blokada
+        time.sleep(3)
+        title = driver.title
+        log.info(f"  Tytuł strony: '{title}'")
+
+        # Sygnały blokady bota
+        page_src_lower = driver.page_source.lower()
+        if any(x in page_src_lower for x in ["captcha", "access denied", "robot", "cloudflare", "challenge"]):
+            log.warning(f"  UWAGA: strona wygląda jak blokada bota!")
+            driver.save_screenshot(f"screenshot_{label.replace(' ', '_').replace('–','_')}_blocked.png")
+            log.info(f"  Screenshot zapisany")
+
+        # Czekamy na listę wyników
         WebDriverWait(driver, PAGE_LOAD_TIMEOUT).until(
             EC.presence_of_element_located(
                 (By.CSS_SELECTOR, "ul#flights-results-list")
             )
         )
+        log.info(f"  Lista wyników załadowana!")
         # Dodatkowe 5s żeby załadowały się wszystkie ceny
         time.sleep(5)
         return driver.page_source
+
     except TimeoutException:
-        log.warning(f"  Timeout — zwracam co jest na stronie")
+        title = driver.title
+        log.warning(f"  Timeout po {PAGE_LOAD_TIMEOUT}s. Tytuł: '{title}'")
+        # Zapisz screenshot żeby zobaczyć co jest na stronie
+        driver.save_screenshot(f"screenshot_{label.replace(' ', '_').replace('–','_')}_timeout.png")
+        log.info(f"  Screenshot zapisany jako screenshot_{label}_timeout.png")
+        # Logujemy pierwsze 500 znaków HTML żeby zobaczyć co zwrócił serwer
+        snippet = driver.page_source[:500].replace("
+", " ")
+        log.info(f"  Początek HTML: {snippet}")
         return driver.page_source
+
     except Exception as e:
         log.error(f"  Błąd Selenium: {e}")
         return None
@@ -255,7 +279,7 @@ def main():
             label = f"{depart.strftime('%d.%m')} – {ret.strftime('%d.%m')}"
             log.info(f"Pobieranie: {label}")
 
-            html    = fetch_page(driver, url)
+            html    = fetch_page(driver, url, label)
             flights = parse_flights(html) if html else []
             best    = cheapest(flights)
 
