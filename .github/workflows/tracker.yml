@@ -35,6 +35,14 @@ jobs:
       - name: Uruchom scraper
         run: python scraper.py
 
+      - name: Wgraj screenshoty jako artefakty
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshots
+          path: screenshot_*.png
+          if-no-files-found: ignore
+
       - name: Usuń credentials.json
         if: always()
         run: rm -f credentials.json
