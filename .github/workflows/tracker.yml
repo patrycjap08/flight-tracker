@@ -1,4 +1,4 @@
-name: Skyscanner Price Tracker
+name: Flight Price Tracker
 
 on:
   schedule:
@@ -7,8 +7,8 @@ on:
 
 jobs:
   scrape:
-    runs-on: ubuntu-22.04
-    timeout-minutes: 45
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     steps:
       - name: Checkout repozytorium
@@ -20,25 +20,17 @@ jobs:
           python-version: "3.12"
           cache: "pip"
 
-      - name: Zainstaluj zależności Python
+      - name: Zainstaluj zależności
         run: pip install -r requirements.txt
-
-      - name: Zainstaluj Playwright Chromium
-        run: playwright install chromium --with-deps
 
       - name: Zapisz credentials.json z Secret
         run: echo '${{ secrets.GOOGLE_CREDENTIALS }}' > credentials.json
 
       - name: Uruchom scraper
+        env:
+          AMADEUS_CLIENT_ID: ${{ secrets.AMADEUS_CLIENT_ID }}
+          AMADEUS_CLIENT_SECRET: ${{ secrets.AMADEUS_CLIENT_SECRET }}
         run: python scraper.py
-
-      - name: Wgraj screenshoty jako artefakty
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: screenshots
-          path: screenshot_*.png
-          if-no-files-found: ignore
 
       - name: Usuń credentials.json
         if: always()
