@@ -35,7 +35,7 @@ CABIN           = "economy"
 STOPS           = "!oneStop,!twoPlusStops"
 DEPARTURE_TIMES = "0-720,780-1439"
 
-PAGE_LOAD_TIMEOUT = 30
+PAGE_LOAD_TIMEOUT = 60
 
 # ─────────────────────────────────────────────────────────────────
 
@@ -84,12 +84,14 @@ def make_driver() -> webdriver.Chrome:
 def fetch_page(driver: webdriver.Chrome, url: str) -> str | None:
     try:
         driver.get(url)
+        # Czekamy na listę wyników — pojawia się gdy Skyscanner załaduje bilety
         WebDriverWait(driver, PAGE_LOAD_TIMEOUT).until(
             EC.presence_of_element_located(
-                (By.CSS_SELECTOR, "h3[class*='bpk-text--body-default']")
+                (By.CSS_SELECTOR, "ul#flights-results-list")
             )
         )
-        time.sleep(random.uniform(3, 5))
+        # Dodatkowe 5s żeby załadowały się wszystkie ceny
+        time.sleep(5)
         return driver.page_source
     except TimeoutException:
         log.warning(f"  Timeout — zwracam co jest na stronie")
